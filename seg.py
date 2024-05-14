@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 
 def list_files_with_sizes(startpath):
     """ Returns a list of files and their sizes from the given startpath. """
@@ -10,48 +11,94 @@ def list_files_with_sizes(startpath):
             file_list.append((filepath, size))
     return file_list
 
-def sort_files_dfs(file_list):
-    """ Sorts files by their depth-first search order in the directory tree. """
-    
-    
-    file_list.sort(key=lambda item: (item[0].count(os.sep), item[0]))
-    # file_list.sort(key=lambda item: (item[0].count(os.sep), item[0].split(os.sep)[-2], item[0].split(os.sep)[-1]))
-    file_list.reverse()
-    return file_list
+def print_tree(node, indent=0):
+    """ Prints the tree structure, indenting child nodes. """
+    # Print the current node's name with indentation
+    print(' ' * indent + node.name + f" ({node.total_size})")
+    # Recursively print each child, increasing the indentation
+    for child in node.children.values():
+        print_tree(child, indent + 2)
+    # Optionally, list files at this node with further indentation
+    if node.files:
+        for file, size in node.files:
+            print(' ' * (indent + 2) + os.path.basename(file) + f" ({size} bytes)")
 
-def chunk_directories(file_list, startpath, max_size=1e9):
-    """ Groups files into directory-based chunks where each chunk has a cumulative size <= max_size. """
-    dir_dict = {}
+
+class TreeNode:
+    """ A node in the directory tree. """
+    def __init__(self, name):
+        self.name = name
+        self.children = defaultdict(lambda: None)  # Temporarily set to None
+        self.files = []
+        self.total_size = 0
+
+    def get_child(self, name):
+        """ Retrieves a child node, creating it if it does not exist. """
+        if not self.children[name]:
+            self.children[name] = TreeNode(name)
+        return self.children[name]
+
+def build_tree(file_list):
+    """ Builds a tree from the given list of files. """
+    root = TreeNode('root')
     for filepath, size in file_list:
-        # Determine the top-level subdirectory
-        sub_path = filepath[len(startpath):].strip(os.sep).split(os.sep)[0]
-        full_dir_path = os.path.join(startpath, sub_path)
-        if full_dir_path not in dir_dict:
-            dir_dict[full_dir_path] = 0
-        dir_dict[full_dir_path] += size
+        parts = filepath.strip(os.sep).split(os.sep)
+        current = root
+        for part in parts[:-1]:  # Traverse through parts, skipping the last one (file)
+            current = current.get_child(part)
+        current.files.append((filepath, size))
+        # current.total_size += size
+        # print_tree(root)
+    return root
 
-    # Now aggregate into chunks
-    chunks = []
-    current_chunk = []
-    current_size = 0
-    for dir_path, total_size in dir_dict.items():
-        if current_size + total_size > max_size:
-            if current_chunk:
-                chunks.append(current_chunk)
-            current_chunk = [dir_path]
-            current_size = total_size
-        else:
-            current_chunk.append(dir_path)
-            current_size += total_size
-    if current_chunk:
-        chunks.append(current_chunk)
-    return chunks
+# def dfs_collect_batches(node, max_size=1e9):
+def dfs_collect_batches(node, max_size=999):
+    """ Collects batches of files using DFS, ensuring no batch exceeds the max_size. """
+    batches = []
+    current_batch = []
+    current_batch_size = 0
 
-def generate_cp_commands(chunks, dest_directory):
-    """ Generates cp commands to copy each chunk to the destination directory. """
+    # Process current node's files
+    for filepath, size in node.files:
+        if current_batch_size + size > max_size:
+            batches.append(current_batch)
+            current_batch = []
+            current_batch_size = 0
+        current_batch.append(filepath)
+        current_batch_size += size
+
+    # Process child nodes
+    for child in node.children.values():
+        child_batches = dfs_collect_batches(child, max_size)
+        for batch in child_batches:
+            batch_size = sum(os.path.getsize(f) for f in batch)
+            if current_batch_size + batch_size > max_size:
+                batches.append(current_batch)
+                current_batch = []
+                current_batch_size = 0
+            current_batch.extend(batch)
+            current_batch_size += batch_size
+
+    if current_batch:
+        batches.append(current_batch)
+    return batches
+
+def recalculate_sizes(node):
+    """ Recalculates the total size of each node to include the size of all its children. """
+    # Start with the size of direct files under this node
+    total_size = sum(size for _, size in node.files)
+    # Add the size of all children
+    for child in node.children.values():
+        child_size = recalculate_sizes(child)  # Recursively calculate the size for children
+        total_size += child_size
+    node.total_size = total_size  # Update the node's total size
+    return total_size  # Return the total size for use by parent nodes
+
+def generate_cp_commands(batches, dest_directory):
+    """ Generates cp commands to copy each batch to the destination directory. """
     commands = []
-    for i, chunk in enumerate(chunks):
-        files = ' '.join([f"'{f}'" for f in chunk])
+    for batch in batches:
+        files = ' '.join([f"'{f}'" for f in batch])
         command = f"cp {files} '{dest_directory}'"
         commands.append(command)
     return commands
@@ -63,14 +110,21 @@ destination_directory = '/path/to/destination'
 # Get files and sizes
 files_with_sizes = list_files_with_sizes(source_directory)
 
-# Sort files by DFS order
-sorted_files = sort_files_dfs(files_with_sizes)
+# Build the directory tree
+tree_root = build_tree(files_with_sizes)
 
-# Chunk files by directory
-chunks = chunk_directories(sorted_files, source_directory)
+print_tree(tree_root)
+
+# Recalculate sizes
+recalculate_sizes(tree_root)
+
+print_tree(tree_root)
+
+# Collect batches of files
+batches = dfs_collect_batches(tree_root)
 
 # Generate commands
-cp_commands = generate_cp_commands(chunks, destination_directory)
+cp_commands = generate_cp_commands(batches, destination_directory)
 
 # Output commands
 for cmd in cp_commands:
